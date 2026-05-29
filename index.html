@@ -161,6 +161,13 @@ canvas{
     pointer-events: none;
     z-index: 20;
 }
+/* Premium 3D Glow layer (WebGL). Sits BEHIND the crisp 2D note canvas (#fx,
+   z-index 20) so additive bloom halos pop behind the sharp note bodies — gives
+   the neon depth / 3D pop. Above the custom background (z-index 1). Hidden by
+   default unless the WebGL layer initializes and the user enables it; this is a
+   pure progressive enhancement (Canvas2D path is untouched on fallback). */
+#fxgl{ z-index: 10; display:none; }
+#fxgl.glow-on{ display:block; }
 #saberLine{
     position:absolute;
     left:0;
@@ -2030,6 +2037,13 @@ body.layout-changing #piano .black.active{
                     </div>
                     <div class="toggle-switch" id="fallingNoteToggle"><div class="toggle-track" id="fallingNoteTrack"><div class="toggle-thumb"></div></div></div>
                 </div>
+                <div style="display:flex; justify-content:space-between; align-items:center; gap:12px; margin-top:10px; padding-top:10px; border-top:1px solid rgba(255,255,255,0.07);" id="rowGlow3d">
+                    <div>
+                        <div class="section-title" style="margin-bottom:3px;">3D Glow <span style="font-size:9px; font-weight:800; letter-spacing:0.5px; color:#061117; background:linear-gradient(135deg,#5bc6f2,#7fe2ff); padding:1px 6px; border-radius:6px; vertical-align:middle;">WEBGL</span></div>
+                        <div style="color:rgba(255,255,255,0.42); font-size:10px; font-weight:700;" id="glow3dHint">Premium neon bloom &amp; depth behind falling notes</div>
+                    </div>
+                    <div class="toggle-switch" id="glow3dToggle"><div class="toggle-track" id="glow3dTrack"><div class="toggle-thumb"></div></div></div>
+                </div>
             </div>
             <div class="color-row compact-color-row" id="rowSaberFx">
                 <div class="section-title">Saber / Particle FX</div>
@@ -2474,7 +2488,7 @@ body.layout-changing #piano .black.active{
         </div>
         <button class="metro-start-btn" id="metroStartBtn">Start</button>
     </div>
-    <div class="stage"><div id="customBgLayer"></div><canvas id="fx"></canvas><div id="saberLine"></div><div id="chordDisplay"><div class="chord-name primary" id="chordPrimary"></div><div class="chord-name secondary" id="chordSecondary"></div></div></div><div id="perfHud" class="perf-hud"><span class="perf-fps">-- FPS</span></div>
+    <div class="stage"><div id="customBgLayer"></div><canvas id="fxgl"></canvas><canvas id="fx"></canvas><div id="saberLine"></div><div id="chordDisplay"><div class="chord-name primary" id="chordPrimary"></div><div class="chord-name secondary" id="chordSecondary"></div></div></div><div id="perfHud" class="perf-hud"><span class="perf-fps">-- FPS</span></div>
     <div id="swipeStrip"></div>
     <div id="pianoWrap"><div id="pianoViewport"><div id="piano"></div></div></div>
 </div>
@@ -3200,6 +3214,12 @@ function getRenderDPR(){
 }
 let transpose=0, falling=[], isAnimOn=true, isSus=true, animStyle='default', animShape='rounded', animSize=18, animBrightness=100, animSaturation=100, visualTheme='default', wCount=52, lastFrameTime=0, viewOffset=0, whiteKeyWidth=0;
 let showNoteOnFalling=false;
+// Premium 3D Glow (WebGL) state. glow3dEnabled = user toggle (persisted via
+// the same path as other prefs); glow3dActive = enabled AND WebGL initialized
+// AND graphic tier allows it. The 2D path never reads these — they only gate
+// the additive bloom drawn on the separate #fxgl canvas.
+let glow3dEnabled = false;
+let glow3dActive = false;
 // Physics: use px/s. At 60fps dt≈0.0167s → 200px/s feels fluid.
 // Cap dt to 20ms (1 missed frame) so a jank spike doesn't teleport notes.
 const RISE_SPEED=200, MAX_NOTE_HEIGHT=400;
@@ -4586,6 +4606,239 @@ function themeBaseColor(hex){
     return { rgb, hex: fallback };
 }
 
+// =====================================================================
+// PREMIUM 3D GLOW LAYER (WebGL) — progressive enhancement.
+//
+// Renders a soft, additive neon bloom + depth halo BEHIND each falling note
+// onto a separate <canvas id="fxgl"> (z-index 10, under the crisp #fx note
+// canvas at z-index 20). The 2D renderer is 100% untouched — if WebGL is
+// unavailable, fails to init, or the user turns this off, the app behaves
+// exactly as before (the gl canvas stays display:none).
+//
+// Design goals matching this codebase:
+//   * Zero hot-path allocation: one preallocated Float32Array vertex buffer,
+//     filled in place each frame, single bufferData upload + one drawArrays.
+//   * Resolution independent: SDF math is done in CSS px, viewport is physical
+//     px, so it stays sharp at any DPR without per-DPR rebakes.
+//   * Mobile-safe: additive premultiplied blend (cheap, no read-back), capped
+//     glow-quad count, gated to the "High" graphic tier by default.
+//
+// Vertex layout (10 floats / vertex):
+//   [0,1] clip-space xy   [2,3] local px (offset from note center)
+//   [4,5] core half-size px   [6,7,8] rgb 0..1   [9] glow intensity
+// =====================================================================
+const GlowGL = (function(){
+    const MAX_GLOW = 600;              // hard cap on glow quads per frame
+    const FLOATS_PER_VERT = 10;
+    const VERTS_PER_QUAD = 6;
+    const GLOW_PX = 16.0;              // exponential falloff radius (CSS px)
+    let gl = null, prog = null, vbo = null, ready = false, lost = false;
+    let glCanvas = null;
+    let aPos, aLocal, aCore, aColor, uGlowPx;
+    let glW = 0, glH = 0, glDPR = 0;
+    let quadCount = 0;
+    // Preallocated CPU-side vertex scratch — never reallocated after boot.
+    const verts = new Float32Array(MAX_GLOW * VERTS_PER_QUAD * FLOATS_PER_VERT);
+    // Per-quad corner scratch (6 verts) reused across all pushGlow calls.
+    const _glLX = new Float32Array(6);
+    const _glLY = new Float32Array(6);
+
+    const VERT = [
+        'attribute vec2 aPos;',
+        'attribute vec2 aLocal;',
+        'attribute vec2 aCore;',
+        'attribute vec4 aColor;',
+        'varying vec2 vLocal;',
+        'varying vec2 vCore;',
+        'varying vec4 vColor;',
+        'void main(){',
+        '  vLocal = aLocal; vCore = aCore; vColor = aColor;',
+        '  gl_Position = vec4(aPos, 0.0, 1.0);',
+        '}'
+    ].join('\n');
+
+    // Box-SDF glow: full intensity inside the note core, soft exponential
+    // falloff outside. Premultiplied additive output so overlapping glows
+    // accumulate into a brighter bloom over the dark stage.
+    const FRAG = [
+        'precision mediump float;',
+        'varying vec2 vLocal;',
+        'varying vec2 vCore;',
+        'varying vec4 vColor;',
+        'uniform float uGlowPx;',
+        'void main(){',
+        '  vec2 dd = abs(vLocal) - vCore;',
+        '  vec2 outside = max(dd, vec2(0.0));',
+        '  float dist = length(outside);',
+        '  float glow = exp(-dist / uGlowPx);',
+        '  float inside = (1.0 - step(0.0, dd.x)) * (1.0 - step(0.0, dd.y));',
+        '  float i = max(glow, inside) * vColor.a;',
+        '  gl_FragColor = vec4(vColor.rgb * i, i);',
+        '}'
+    ].join('\n');
+
+    function compile(type, src){
+        const s = gl.createShader(type);
+        gl.shaderSource(s, src); gl.compileShader(s);
+        if(!gl.getShaderParameter(s, gl.COMPILE_STATUS)){
+            console.warn('[GlowGL] shader compile failed:', gl.getShaderInfoLog(s));
+            gl.deleteShader(s); return null;
+        }
+        return s;
+    }
+
+    function init(){
+        if(ready) return true;
+        glCanvas = document.getElementById('fxgl');
+        if(!glCanvas) return false;
+        const attrs = { alpha:true, premultipliedAlpha:true, antialias:false, depth:false, stencil:false, preserveDrawingBuffer:false, powerPreference:'high-performance' };
+        try {
+            gl = glCanvas.getContext('webgl', attrs) || glCanvas.getContext('experimental-webgl', attrs);
+        } catch(e){ gl = null; }
+        if(!gl){ return false; }
+
+        const vs = compile(gl.VERTEX_SHADER, VERT);
+        const fs = compile(gl.FRAGMENT_SHADER, FRAG);
+        if(!vs || !fs){ return false; }
+        prog = gl.createProgram();
+        gl.attachShader(prog, vs); gl.attachShader(prog, fs); gl.linkProgram(prog);
+        if(!gl.getProgramParameter(prog, gl.LINK_STATUS)){
+            console.warn('[GlowGL] link failed:', gl.getProgramInfoLog(prog));
+            return false;
+        }
+        gl.useProgram(prog);
+        aPos   = gl.getAttribLocation(prog, 'aPos');
+        aLocal = gl.getAttribLocation(prog, 'aLocal');
+        aCore  = gl.getAttribLocation(prog, 'aCore');
+        aColor = gl.getAttribLocation(prog, 'aColor');
+        uGlowPx = gl.getUniformLocation(prog, 'uGlowPx');
+        vbo = gl.createBuffer();
+        gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+        const stride = FLOATS_PER_VERT * 4;
+        gl.enableVertexAttribArray(aPos);   gl.vertexAttribPointer(aPos,   2, gl.FLOAT, false, stride, 0);
+        gl.enableVertexAttribArray(aLocal); gl.vertexAttribPointer(aLocal, 2, gl.FLOAT, false, stride, 2*4);
+        gl.enableVertexAttribArray(aCore);  gl.vertexAttribPointer(aCore,  2, gl.FLOAT, false, stride, 4*4);
+        gl.enableVertexAttribArray(aColor); gl.vertexAttribPointer(aColor, 4, gl.FLOAT, false, stride, 6*4);
+
+        gl.disable(gl.DEPTH_TEST);
+        gl.enable(gl.BLEND);
+        gl.blendFunc(gl.ONE, gl.ONE); // premultiplied additive
+        gl.clearColor(0, 0, 0, 0);
+
+        glCanvas.addEventListener('webglcontextlost', (ev) => { ev.preventDefault(); lost = true; ready = false; }, false);
+        glCanvas.addEventListener('webglcontextrestored', () => { ready = false; lost = false; init(); }, false);
+
+        ready = true;
+        return true;
+    }
+
+    function syncSize(){
+        const w = canvasCssW, h = canvasCssH, dpr = currentDPR || 1;
+        if(w === glW && h === glH && dpr === glDPR) return;
+        glW = w; glH = h; glDPR = dpr;
+        const pw = Math.max(1, Math.round(w * dpr));
+        const ph = Math.max(1, Math.round(h * dpr));
+        if(glCanvas.width !== pw) glCanvas.width = pw;
+        if(glCanvas.height !== ph) glCanvas.height = ph;
+        glCanvas.style.width = w + 'px';
+        glCanvas.style.height = h + 'px';
+        gl.viewport(0, 0, pw, ph);
+    }
+
+    // Begin a frame: ensure size + clear the transparent backbuffer.
+    function begin(){
+        if(!ready || !gl) return false;
+        syncSize();
+        gl.clear(gl.COLOR_BUFFER_BIT);
+        quadCount = 0;
+        return true;
+    }
+
+    // Push one glow quad. cx/cy = note center (CSS px, canvas space),
+    // halfW/halfH = solid note half-size (CSS px), r/g/b = 0..255, intensity 0..~1.5.
+    // Fully inlined (no closures) — runs once per note per frame in the hot loop.
+    function pushGlow(cx, cy, halfW, halfH, r, g, b, intensity){
+        if(quadCount >= MAX_GLOW) return;
+        const W = glW, H = glH;
+        if(W <= 0 || H <= 0) return;
+        const margin = GLOW_PX * 3.0; // quad must extend past core for falloff room
+        const ox = halfW + margin, oy = halfH + margin;
+        const lx0 = -ox, lx1 = ox, ly0 = -oy, ly1 = oy;
+        const rf = r / 255, gf = g / 255, bf = b / 255;
+        const v = verts;
+        const F = FLOATS_PER_VERT;
+        let o = quadCount * VERTS_PER_QUAD * F;
+        const i2W = 2 / W, i2H = 2 / H;
+        // 6 vertices (2 triangles): (lx0,ly0)(lx1,ly0)(lx1,ly1) + (lx0,ly0)(lx1,ly1)(lx0,ly1)
+        const LX = _glLX, LY = _glLY;
+        LX[0]=lx0; LY[0]=ly0; LX[1]=lx1; LY[1]=ly0; LX[2]=lx1; LY[2]=ly1;
+        LX[3]=lx0; LY[3]=ly0; LX[4]=lx1; LY[4]=ly1; LX[5]=lx0; LY[5]=ly1;
+        for(let k=0;k<6;k++){
+            const lx = LX[k], ly = LY[k];
+            v[o]   = (cx + lx) * i2W - 1;   // clip x
+            v[o+1] = 1 - (cy + ly) * i2H;   // clip y (flip)
+            v[o+2] = lx;                    // local px x
+            v[o+3] = ly;                    // local px y
+            v[o+4] = halfW;                 // core half x
+            v[o+5] = halfH;                 // core half y
+            v[o+6] = rf; v[o+7] = gf; v[o+8] = bf;
+            v[o+9] = intensity;
+            o += F;
+        }
+        quadCount++;
+    }
+
+    // Upload + draw everything pushed this frame.
+    function flush(){
+        if(!ready || !gl || quadCount === 0) return;
+        gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+        // Upload only the used sub-range — avoids touching the whole 600-quad buffer.
+        const used = quadCount * VERTS_PER_QUAD * FLOATS_PER_VERT;
+        gl.bufferData(gl.ARRAY_BUFFER, verts.subarray(0, used), gl.DYNAMIC_DRAW);
+        gl.uniform1f(uGlowPx, GLOW_PX);
+        gl.drawArrays(gl.TRIANGLES, 0, quadCount * VERTS_PER_QUAD);
+    }
+
+    function clear(){
+        if(!ready || !gl) return;
+        syncSize();
+        gl.clear(gl.COLOR_BUFFER_BIT);
+        quadCount = 0;
+    }
+
+    function isSupported(){ return ready && !lost; }
+
+    return { init, begin, pushGlow, flush, clear, syncSize, isSupported,
+             get ready(){ return ready; } };
+})();
+
+// Mirror of drawFallingNote()'s geometry — computes a note's on-canvas center,
+// half-size and tuned color, then pushes a glow quad. Kept allocation-free and
+// in sync with the 2D path so the bloom sits exactly behind each note body.
+function emitNoteGlow(f){
+    const fastX = noteXFast[f.midi];
+    const cachedX = Number.isFinite(fastX) ? fastX : noteXCache.get(f.midi);
+    if(cachedX === undefined || !Number.isFinite(cachedX)) return;
+    const x = cachedX - currentPianoTransformPx;
+    const _kw = whiteKeyWidth > 0 ? whiteKeyWidth : animSize;
+    const _effSize = Math.min(animSize, Math.max(4, _kw * 0.9));
+    const w = isBlack(f.midi) ? _effSize * 0.7 : _effSize;
+    const h = Math.max(6, f.height);
+    const cx = x;
+    const cy = f.y + h * 0.5;
+    // Cull anything fully off-canvas (plus glow margin handled by the quad itself).
+    if(cx < -64 || cx > canvasCssW + 64) return;
+    if(cy + h < -64 || cy - h > canvasCssH + 64) return;
+    // Color: same source + tone tuning the 2D renderer uses, so glow matches body.
+    const baseRgb = safeHex(f.base || cachedAnimColor || '#78dcff', '#78dcff');
+    const tuned = tuneRgbForFalling(baseRgb);
+    // Newer (lower on screen) notes glow a touch hotter for a sense of depth;
+    // notes fade their bloom slightly as they rise. Subtle, capped.
+    const depth = canvasCssH > 0 ? Math.max(0, Math.min(1, cy / canvasCssH)) : 0.5;
+    const intensity = 0.55 + depth * 0.45;
+    GlowGL.pushGlow(cx, cy, w * 0.5, h * 0.5, tuned[0], tuned[1], tuned[2], intensity);
+}
+
 function anim(now){
     renderNow = now;
     // Use the RAF-provided high-res timestamp directly.
@@ -4616,6 +4869,10 @@ function anim(now){
 
     let hasLive = false;
     frameBurstLevel = getBurstLevel();
+    // Premium 3D Glow: begin the WebGL bloom frame (clears the gl backbuffer).
+    // glActive is latched once per frame so the per-note hot loop just checks a
+    // local boolean. Pure no-op when the feature is off / unsupported.
+    const glActive = glow3dActive && GlowGL.begin();
     for(let i=0;i<falling.length;i++){
         const f=falling[i];
         if(f.dead) continue;
@@ -4632,9 +4889,12 @@ function anim(now){
             if(f.bottomY !== undefined) f.bottomY -= dy;
         }
         if(f.y+f.height<0){ f.dead=true; continue; }
+        if(glActive) emitNoteGlow(f);
         drawFallingNote(f);
         hasLive = true;
     }
+    // One upload + one drawArrays for the whole glow layer.
+    if(glActive) GlowGL.flush();
 
     if(updateDrawNeonDust(dt, now)) hasLive = true;
 
@@ -4656,6 +4916,8 @@ function anim(now){
     if(hasLive) animFrameId=requestAnimationFrame(anim);
     else {
         animFrameId=null; lastFrameTime=0; smoothAnimDt=1/60; falling.length=0; fallingByMidi.clear();
+        // No live notes → wipe the WebGL glow layer so no stale bloom lingers.
+        if(glow3dActive && GlowGL.isSupported()) GlowGL.clear();
         // P12 (PLAN A): tidak ada falling note hidup, juga cek tidak ada note ditekan.
         // Kalau dua-duanya kosong → idle-no-notes → CSS pause animasi saber.
         if(pressStartTimes.size === 0 && document.body && !document.body.classList.contains('idle-no-notes')){
@@ -4702,6 +4964,8 @@ function syncCanvasSize(forceReadStage){
     ctx2d.globalCompositeOperation = 'source-over';
     cachedStageHeight = nextH;
     _cachedStageRect = null; // P4: stage size changed, force re-measure on next geom read
+    // Keep the WebGL glow backbuffer in lockstep with the 2D canvas size/DPR.
+    if(typeof GlowGL !== 'undefined' && GlowGL.isSupported && GlowGL.isSupported()) GlowGL.syncSize();
 }
 function resize(){
     if(resizeRaf) cancelAnimationFrame(resizeRaf);
@@ -5102,6 +5366,44 @@ function setShowNoteOnFalling(val){
 }
 const fallingNoteTrack = document.getElementById('fallingNoteTrack');
 if(fallingNoteTrack) fallingNoteTrack.onclick = () => setShowNoteOnFalling(!showNoteOnFalling);
+// ===== Premium 3D Glow (WebGL) toggle =====
+function refreshGlow3dActive(){
+    // Active only when: user enabled it, WebGL initialized OK, and the graphic
+    // tier permits heavy FX (Low = FPS mode stays pure-2D, no bloom).
+    const tierOk = (typeof getGraphicProfile === 'function') ? !!getGraphicProfile().heavyFx : true;
+    glow3dActive = glow3dEnabled && GlowGL.isSupported() && tierOk;
+    const c = document.getElementById('fxgl');
+    if(c) c.classList.toggle('glow-on', glow3dActive);
+    if(!glow3dActive && GlowGL.isSupported()) GlowGL.clear();
+    if(glow3dActive && falling.length > 0 && typeof ensureAnimLoop === 'function') ensureAnimLoop();
+}
+function setGlow3d(val){
+    glow3dEnabled = !!val;
+    const track = document.getElementById('glow3dTrack');
+    const hint = document.getElementById('glow3dHint');
+    if(glow3dEnabled){
+        // Lazy WebGL init on first enable — no GPU context cost unless wanted.
+        const ok = GlowGL.init();
+        if(!ok && hint){
+            hint.textContent = 'WebGL not available on this device — using 2D';
+            glow3dEnabled = false;
+        } else if(hint){
+            hint.innerHTML = 'Premium neon bloom &amp; depth behind falling notes';
+        }
+    }
+    if(track) track.classList.toggle('active', glow3dEnabled);
+    refreshGlow3dActive();
+    try { localStorage.setItem('papiano.glow3d', glow3dEnabled ? '1' : '0'); } catch(e){}
+}
+const glow3dTrack = document.getElementById('glow3dTrack');
+if(glow3dTrack) glow3dTrack.onclick = () => setGlow3d(!glow3dEnabled);
+// Restore saved preference (default OFF — opt-in premium enhancement).
+try {
+    if(localStorage.getItem('papiano.glow3d') === '1'){
+        // Defer one tick so canvas + sizing globals are ready.
+        requestAnimationFrame(() => setGlow3d(true));
+    }
+} catch(e){}
 function setAnimShape(shape){
     animShape = (shape === 'rect' || shape === 'rounded') ? shape : 'rounded';
     if(typeof clearEffectSpriteCache === 'function') clearEffectSpriteCache();
@@ -6581,6 +6883,8 @@ applyLang();
         });
 
         if(typeof ensureAnimLoop === 'function' && falling.length>0) ensureAnimLoop();
+        // 3D Glow respects the tier: Low (heavyFx off) disables bloom entirely.
+        if(typeof refreshGlow3dActive === 'function') refreshGlow3dActive();
     }
     Object.entries(btns).forEach(([id, val]) => {
         const b = document.getElementById(id);
